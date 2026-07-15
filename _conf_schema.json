@@ -1,20 +1,45 @@
 {
-  "video_quality": {
-    "description": "视频大小",
-    "type": "string",
-    "options": ["无损压缩", "有损压缩 720p 60", "有损压缩 720p 30", "有损压缩 480p 60"],
-    "default": "有损压缩 720p 30"
+  "video_compress": {
+    "description": "视频压缩设置",
+    "type": "object",
+    "items": {
+      "quality": {
+        "description": "视频大小",
+        "type": "string",
+        "options": ["无损压缩", "有损压缩 720p 60", "有损压缩 720p 30", "有损压缩 480p 60"],
+        "default": "有损压缩 720p 30"
+      },
+      "auto_compress": {
+        "description": "自动触发压缩视频",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，当视频文件大小超过阈值时会自动压缩"
+      },
+      "threshold": {
+        "description": "自动压缩阈值 (MB)",
+        "type": "int",
+        "default": 300,
+        "hint": "单位：MB，仅当自动触发压缩视频开启时生效"
+      }
+    }
   },
-  "auto_compress": {
-    "description": "自动触发压缩视频",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后，当视频文件大小超过阈值时会自动压缩"
-  },
-  "auto_compress_threshold": {
-    "description": "自动压缩超过多大的视频MB",
-    "type": "int",
-    "default": 300,
-    "hint": "单位：MB，仅当自动触发压缩视频开启时生效"
+  "group_control": {
+    "description": "群组控制设置",
+    "type": "object",
+    "items": {
+      "mode": {
+        "description": "启用模式",
+        "type": "string",
+        "options": ["黑名单", "白名单"],
+        "default": "白名单",
+        "hint": "白名单：仅指定群号生效；黑名单：指定群号不生效"
+      },
+      "group_ids": {
+        "description": "群号列表",
+        "type": "list",
+        "default": [],
+        "hint": "填写需要生效或不生效的群号列表（根据启用模式决定）"
+      }
+    }
   }
 }
