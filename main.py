@@ -1,28 +1,35 @@
 import os
 import asyncio
 import uuid
-import shutil
 from pathlib import Path
 from typing import Optional
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.api.message_components import Video, Plain
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.star import Context, Star, register
+from astrbot.api.message_components import Video, Plain, Reply, File
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
 
-@register("astrbot_plugin_video_compress", "BUGJI", "视频自动压缩器 - 群内视频自动压缩并发回原群", "1.3.0", "https://github.com/BUGJI/astrbot_plugin_video_compress")
+@register("astrbot_plugin_video_compress", "BUGJI", "视频自动压缩器 - 群内视频自动压缩并发回原群 (支持NVIDIA GPU加速)", "2.0.0", "https://github.com/BUGJI/astrbot_plugin_video_compress")
 class VideoCompressPlugin(Star):
-    def __init__(self, context: Context):
-        super().__init__(context)
-        self.config = context.config.get("video_compress", {})
-        self.group_config = context.config.get("group_control", {})
+    def __init__(self, context: Context, config: dict | None = None):
+        super().__init__(context, config)
+        self.video_config = config.get("video_compress", {}) if config else {}
+        self.group_config = config.get("group_control", {}) if config else {}
+        self._gpu_available = None  # 缓存GPU检测结果
 
     async def initialize(self):
-        logger.info("视频压缩插件已加载")
+        logger.info("视频压缩插件已加载 (支持NVIDIA GPU加速)")
         if not await self._check_ffmpeg():
             logger.warning("未检测到 ffmpeg/ffprobe，视频压缩功能将不可用")
+        
+        # 检测GPU支持
+        self._gpu_available = await self._check_nvenc_support()
+        if self._gpu_available:
+            logger.info("✅ 检测到NVIDIA GPU，将使用NVENC硬件加速")
+        else:
+            logger.info("未检测到NVIDIA GPU或NVENC不支持，将使用CPU软编码")
 
     async def terminate(self):
         pass
@@ -31,12 +38,36 @@ class VideoCompressPlugin(Star):
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-version",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-            await proc.wait()
+            stdout, _ = await proc.communicate()
             return proc.returncode == 0
         except FileNotFoundError:
+            return False
+
+    async def _check_nvenc_support(self) -> bool:
+        """检测NVIDIA GPU和NVENC编码器是否可用"""
+        try:
+            # 检查是否有NVIDIA GPU
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, _ = await proc.communicate()
+            if proc.returncode != 0:
+                return False
+            
+            # 检查ffmpeg是否支持NVENC
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-encoders",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            return "h264_nvenc" in stdout.decode()
+        except (FileNotFoundError, Exception):
             return False
 
     async def _get_video_info(self, file_path: str) -> dict:
@@ -72,9 +103,43 @@ class VideoCompressPlugin(Star):
         else:
             return group_id not in group_ids
 
+    def _extract_video(self, messages: list) -> Video | File | None:
+        """从消息链中提取视频，包括引用消息中的视频和文件类型的视频"""
+        video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.webm', '.m4v', '.3gp', '.ts', '.mts'}
+        
+        for msg in messages:
+            if isinstance(msg, Video):
+                return msg
+            if isinstance(msg, File):
+                # 检查文件是否为视频格式
+                if msg.name:
+                    ext = os.path.splitext(msg.name)[1].lower()
+                    if ext in video_extensions:
+                        return msg
+            if isinstance(msg, Reply) and msg.chain:
+                for comp in msg.chain:
+                    if isinstance(comp, Video):
+                        return comp
+                    if isinstance(comp, File):
+                        if comp.name:
+                            ext = os.path.splitext(comp.name)[1].lower()
+                            if ext in video_extensions:
+                                return comp
+        return None
+
+    def _should_use_gpu(self) -> bool:
+        """判断是否应该使用GPU编码"""
+        config_value = self.video_config.get("use_gpu", "auto")
+        if config_value == "auto":
+            return self._gpu_available if self._gpu_available is not None else False
+        elif config_value == "enabled":
+            return True
+        else:  # "disabled"
+            return False
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
-        if not self.config.get("auto_compress", False):
+        if not self.video_config.get("auto_compress", False):
             return
 
         group_id = event.get_group_id()
@@ -82,33 +147,39 @@ class VideoCompressPlugin(Star):
             return
 
         messages = event.get_messages()
-        for msg in messages:
-            if isinstance(msg, Video):
-                async for result in self._process_video(event, msg):
-                    yield result
+        video = self._extract_video(messages)
+        if video:
+            async for result in self._process_video(event, video):
+                yield result
 
-    async def _process_video(self, event: AstrMessageEvent, video: Video):
+    async def _process_video(self, event: AstrMessageEvent, video: Video | File):
         try:
-            file_path = await video.convert_to_file_path()
+            # 获取本地文件路径 - Video 和 File 有不同的方法
+            if isinstance(video, Video):
+                file_path = await video.convert_to_file_path()
+            else:  # File
+                file_path = await video.get_file()
+            
             if not file_path or not os.path.exists(file_path):
                 logger.warning(f"视频文件不存在: {file_path}")
                 return
 
             file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            threshold_mb = self.config.get("threshold", 300)
+            threshold_mb = self.video_config.get("threshold", 300)
 
             if file_size_mb < threshold_mb:
                 return
 
-            quality = self.config.get("quality", "有损压缩 720p 30")
+            quality = self.video_config.get("quality", "有损压缩 720p 30")
             output_path = await self._compress_video(file_path, quality)
 
             if output_path and os.path.exists(output_path):
                 compressed_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                logger.info(f"视频压缩完成: {file_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB")
+                gpu_info = " (GPU加速)" if self._should_use_gpu() else ""
+                logger.info(f"视频压缩完成{ gpu_info }: {file_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB")
 
                 compressed_video = Video.fromFileSystem(output_path)
-                yield event.chain_result([compressed_video, Plain(f"视频已压缩: {file_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB")])
+                yield event.chain_result([compressed_video, Plain(f"视频已压缩: {file_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB{gpu_info}")])
             else:
                 yield event.plain_result("视频压缩失败")
 
@@ -122,61 +193,173 @@ class VideoCompressPlugin(Star):
         output_filename = f"compressed_{uuid.uuid4().hex[:8]}.mp4"
         output_path = os.path.join(temp_dir, output_filename)
 
+        # 检查是否使用GPU
+        use_gpu = self._should_use_gpu()
+        use_nvenc = use_gpu and self._gpu_available
+        
+        # 构建基础压缩命令
         if quality == "无损压缩":
-            cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                "-c:v", "libx264", "-crf", "0", "-preset", "veryslow",
-                "-c:a", "copy",
-                output_path
-            ]
+            if use_nvenc:
+                # NVENC不支持无损压缩，降级到CPU
+                logger.info("NVENC不支持无损压缩，使用CPU编码")
+                cmd = [
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-c:v", "libx264", "-crf", "0", "-preset", "veryslow",
+                    "-c:a", "copy",
+                    output_path
+                ]
+            else:
+                cmd = [
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-c:v", "libx264", "-crf", "0", "-preset", "veryslow",
+                    "-c:a", "copy",
+                    output_path
+                ]
         elif quality == "有损压缩 720p 60":
-            cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                "-vf", "scale=-2:720,fps=60",
-                "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                "-c:a", "aac", "-b:a", "128k",
-                output_path
-            ]
+            if use_nvenc:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-hwaccel", "cuda",
+                    "-hwaccel_output_format", "cuda",
+                    "-i", input_path,
+                    "-vf", "scale_cuda=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                    "-r", "60",
+                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    "-metadata:s:v", "rotate=0",
+                    output_path
+                ]
+            else:
+                cmd = [
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease",
+                    "-r", "60",
+                    "-c:v", "libx264", "-crf", "23", "-preset", "medium",
+                    "-c:a", "aac", "-b:a", "128k",
+                    output_path
+                ]
         elif quality == "有损压缩 720p 30":
-            cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                "-vf", "scale=-2:720,fps=30",
-                "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                "-c:a", "aac", "-b:a", "128k",
-                output_path
-            ]
+            if use_nvenc:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-hwaccel", "cuda",
+                    "-hwaccel_output_format", "cuda",
+                    "-i", input_path,
+                    "-vf", "scale_cuda=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                    "-r", "30",
+                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    "-metadata:s:v", "rotate=0",
+                    output_path
+                ]
+            else:
+                cmd = [
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease",
+                    "-r", "30",
+                    "-c:v", "libx264", "-crf", "23", "-preset", "medium",
+                    "-c:a", "aac", "-b:a", "128k",
+                    output_path
+                ]
         elif quality == "有损压缩 480p 60":
-            cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                "-vf", "scale=-2:480,fps=60",
-                "-c:v", "libx264", "-crf", "25", "-preset", "medium",
-                "-c:a", "aac", "-b:a", "96k",
-                output_path
-            ]
+            if use_nvenc:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-hwaccel", "cuda",
+                    "-hwaccel_output_format", "cuda",
+                    "-i", input_path,
+                    "-vf", "scale_cuda=w=854:h=480:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                    "-r", "60",
+                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "25",
+                    "-c:a", "aac", "-b:a", "96k",
+                    "-movflags", "+faststart",
+                    "-metadata:s:v", "rotate=0",
+                    output_path
+                ]
+            else:
+                cmd = [
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-vf", "scale=-2:480:force_original_aspect_ratio=decrease",
+                    "-r", "60",
+                    "-c:v", "libx264", "-crf", "25", "-preset", "medium",
+                    "-c:a", "aac", "-b:a", "96k",
+                    output_path
+                ]
         elif quality == "有损压缩 480p 30":
-            cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                "-vf", "scale=-2:480,fps=30",
-                "-c:v", "libx264", "-crf", "26", "-preset", "medium",
-                "-c:a", "aac", "-b:a", "64k",
-                output_path
-            ]
+            if use_nvenc:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-hwaccel", "cuda",
+                    "-hwaccel_output_format", "cuda",
+                    "-i", input_path,
+                    "-vf", "scale_cuda=w=854:h=480:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                    "-r", "30",
+                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "26",
+                    "-c:a", "aac", "-b:a", "64k",
+                    "-movflags", "+faststart",
+                    "-metadata:s:v", "rotate=0",
+                    output_path
+                ]
+            else:
+                cmd = [
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-vf", "scale=-2:480:force_original_aspect_ratio=decrease",
+                    "-r", "30",
+                    "-c:v", "libx264", "-crf", "26", "-preset", "medium",
+                    "-c:a", "aac", "-b:a", "64k",
+                    output_path
+                ]
         elif quality == "有损压缩 360p 30":
-            cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                "-vf", "scale=-2:360,fps=30",
-                "-c:v", "libx264", "-crf", "28", "-preset", "medium",
-                "-c:a", "aac", "-b:a", "48k",
-                output_path
-            ]
+            if use_nvenc:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-hwaccel", "cuda",
+                    "-hwaccel_output_format", "cuda",
+                    "-i", input_path,
+                    "-vf", "scale_cuda=w=640:h=360:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                    "-r", "30",
+                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "28",
+                    "-c:a", "aac", "-b:a", "48k",
+                    "-movflags", "+faststart",
+                    "-metadata:s:v", "rotate=0",
+                    output_path
+                ]
+            else:
+                cmd = [
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-vf", "scale=-2:360:force_original_aspect_ratio=decrease",
+                    "-r", "30",
+                    "-c:v", "libx264", "-crf", "28", "-preset", "medium",
+                    "-c:a", "aac", "-b:a", "48k",
+                    output_path
+                ]
         else:
-            cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                "-vf", "scale=-2:720,fps=30",
-                "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                "-c:a", "aac", "-b:a", "128k",
-                output_path
-            ]
+            # 默认
+            if use_nvenc:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-hwaccel", "cuda",
+                    "-hwaccel_output_format", "cuda",
+                    "-i", input_path,
+                    "-vf", "scale_cuda=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                    "-r", "30",
+                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    "-metadata:s:v", "rotate=0",
+                    output_path
+                ]
+            else:
+                cmd = [
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease",
+                    "-r", "30",
+                    "-c:v", "libx264", "-crf", "23", "-preset", "medium",
+                    "-c:a", "aac", "-b:a", "128k",
+                    output_path
+                ]
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -188,7 +371,7 @@ class VideoCompressPlugin(Star):
 
             if proc.returncode == 0 and os.path.exists(output_path):
                 # 清理原始临时文件
-                if self.config.get("delete_original_after_compress", True):
+                if self.video_config.get("delete_original_after_compress", True):
                     try:
                         if os.path.exists(input_path) and input_path.startswith(get_astrbot_temp_path()):
                             os.remove(input_path)
@@ -196,7 +379,9 @@ class VideoCompressPlugin(Star):
                         logger.debug(f"清理原始临时文件失败: {e}")
                 return output_path
             else:
-                logger.error(f"FFmpeg 压缩失败: {stderr.decode()}")
+                if proc.returncode != 0:
+                    error_msg = stderr.decode()
+                    logger.error(f"FFmpeg 压缩失败: {error_msg}")
                 if os.path.exists(output_path):
                     os.remove(output_path)
                 return None
@@ -218,11 +403,7 @@ class VideoCompressPlugin(Star):
         质量选项: 无损压缩 / 有损压缩 720p 60 / 有损压缩 720p 30 / 有损压缩 480p 60 / 有损压缩 480p 30 / 有损压缩 360p 30
         回复视频或发送视频后使用此指令"""
         messages = event.get_messages()
-        video_msg = None
-        for msg in messages:
-            if isinstance(msg, Video):
-                video_msg = msg
-                break
+        video_msg = self._extract_video(messages)
 
         if not video_msg:
             yield event.plain_result("请发送或回复一个视频后再使用此指令")
@@ -233,16 +414,21 @@ class VideoCompressPlugin(Star):
             yield event.plain_result(f"无效的质量选项，可选: {', '.join(valid_qualities)}")
             return
 
-        quality = quality or self.config.get("quality", "有损压缩 720p 30")
+        quality = quality or self.video_config.get("quality", "有损压缩 720p 60")
 
         try:
-            file_path = await video_msg.convert_to_file_path()
+            # 获取本地文件路径 - Video 和 File 有不同的方法
+            if isinstance(video_msg, Video):
+                file_path = await video_msg.convert_to_file_path()
+            else:  # File
+                file_path = await video_msg.get_file()
             if not file_path or not os.path.exists(file_path):
                 yield event.plain_result("无法获取视频文件")
                 return
 
             original_size = os.path.getsize(file_path) / (1024 * 1024)
-            yield event.plain_result(f"正在压缩视频 ({original_size:.1f}MB)...")
+            gpu_status = " (使用GPU加速)" if self._should_use_gpu() else ""
+            yield event.plain_result(f"正在压缩视频 ({original_size:.1f}MB)...{gpu_status}")
 
             output_path = await self._compress_video(file_path, quality)
 
@@ -251,7 +437,7 @@ class VideoCompressPlugin(Star):
                 compressed_video = Video.fromFileSystem(output_path)
                 yield event.chain_result([
                     compressed_video,
-                    Plain(f"压缩完成: {original_size:.1f}MB -> {compressed_size:.1f}MB ({quality})")
+                    Plain(f"压缩完成: {original_size:.1f}MB -> {compressed_size:.1f}MB ({quality}){gpu_status}")
                 ])
             else:
                 yield event.plain_result("视频压缩失败")
@@ -267,40 +453,49 @@ class VideoCompressPlugin(Star):
         - auto_compress true/false
         - threshold <MB数值>
         - quality <质量选项>
+        - use_gpu auto/enabled/disabled
         - group_mode 白名单/黑名单
         - group_add <群号>
         - group_remove <群号>
         """
         if not key:
-            config = self.config
+            video_cfg = self.video_config
             group_cfg = self.group_config
+            gpu_status = "✅ 可用" if self._gpu_available else "❌ 不可用"
             yield event.plain_result(
                 f"当前配置:\n"
-                f"自动压缩: {config.get('auto_compress', False)}\n"
-                f"阈值: {config.get('threshold', 300)}MB\n"
-                f"质量: {config.get('quality', '有损压缩 720p 30')}\n"
-                f"清理原文件: {config.get('delete_original_after_compress', True)}\n"
+                f"自动压缩: {video_cfg.get('auto_compress', False)}\n"
+                f"阈值: {video_cfg.get('threshold', 300)}MB\n"
+                f"质量: {video_cfg.get('quality', '有损压缩 720p 30')}\n"
+                f"清理原文件: {video_cfg.get('delete_original_after_compress', True)}\n"
+                f"GPU加速: {video_cfg.get('use_gpu', 'auto')} (GPU状态: {gpu_status})\n"
                 f"群组模式: {group_cfg.get('mode', '白名单')}\n"
                 f"群组列表: {group_cfg.get('group_ids', [])}"
             )
             return
 
         if key == "auto_compress":
-            self.config["auto_compress"] = value.lower() == "true"
-            yield event.plain_result(f"自动压缩已设置为: {self.config['auto_compress']}")
+            self.video_config["auto_compress"] = value.lower() == "true"
+            yield event.plain_result(f"自动压缩已设置为: {self.video_config['auto_compress']}")
         elif key == "threshold":
             try:
-                self.config["threshold"] = int(value)
+                self.video_config["threshold"] = int(value)
                 yield event.plain_result(f"阈值已设置为: {value}MB")
             except ValueError:
                 yield event.plain_result("阈值必须是数字")
         elif key == "quality":
             valid = ["无损压缩", "有损压缩 720p 60", "有损压缩 720p 30", "有损压缩 480p 60", "有损压缩 480p 30", "有损压缩 360p 30"]
             if value in valid:
-                self.config["quality"] = value
+                self.video_config["quality"] = value
                 yield event.plain_result(f"质量已设置为: {value}")
             else:
                 yield event.plain_result(f"无效质量，可选: {', '.join(valid)}")
+        elif key == "use_gpu":
+            if value in ["auto", "enabled", "disabled"]:
+                self.video_config["use_gpu"] = value
+                yield event.plain_result(f"GPU加速已设置为: {value}")
+            else:
+                yield event.plain_result("use_gpu 必须是 auto/enabled/disabled")
         elif key == "group_mode":
             if value in ["白名单", "黑名单"]:
                 self.group_config["mode"] = value
