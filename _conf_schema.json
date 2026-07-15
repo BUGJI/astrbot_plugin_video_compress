@@ -4,22 +4,28 @@
     "type": "object",
     "items": {
       "quality": {
-        "description": "视频大小",
+        "description": "压缩质量预设",
         "type": "string",
-        "options": ["无损压缩", "有损压缩 720p 60", "有损压缩 720p 30", "有损压缩 480p 60"],
+        "options": ["无损压缩", "有损压缩 720p 60", "有损压缩 720p 30", "有损压缩 480p 60", "有损压缩 480p 30", "有损压缩 360p 30"],
         "default": "有损压缩 720p 30"
       },
       "auto_compress": {
         "description": "自动触发压缩视频",
         "type": "bool",
         "default": false,
-        "hint": "开启后，当视频文件大小超过阈值时会自动压缩"
+        "hint": "开启后，当视频文件大小超过阈值时会自动压缩并发回原群"
       },
       "threshold": {
         "description": "自动压缩阈值 (MB)",
         "type": "int",
         "default": 300,
-        "hint": "单位：MB，仅当自动触发压缩视频开启时生效"
+        "hint": "单位：MB，仅当自动触发压缩视频开启时生效。视频超过此大小将被自动压缩"
+      },
+      "delete_original_after_compress": {
+        "description": "压缩后删除临时原视频文件",
+        "type": "bool",
+        "default": true,
+        "hint": "压缩完成后自动清理下载的原视频临时文件，节省磁盘空间"
       }
     }
   },
