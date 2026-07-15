@@ -9,6 +9,10 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import Video, Plain, Reply, File
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from aiocqhttp import CQHttp
 
 
 @register("astrbot_plugin_video_compress", "BUGJI", "视频自动压缩器 - 群内视频自动压缩并发回原群 (支持NVIDIA GPU加速)", "2.0.0", "https://github.com/BUGJI/astrbot_plugin_video_compress")
@@ -33,6 +37,49 @@ class VideoCompressPlugin(Star):
 
     async def terminate(self):
         pass
+
+    async def _mark_emoji(self, event: AstrMessageEvent, stage: str) -> bool:
+        """给消息添加/移除表情回应
+        stage: "start" 开始处理, "done" 完成处理(成功或失败)
+        """
+        try:
+            # 仅支持 aiocqhttp 适配器
+            if not hasattr(event, 'bot') or event.bot is None:
+                return False
+            
+            bot = event.bot
+            message_id = event.message_obj.message_id if hasattr(event.message_obj, 'message_id') else None
+            
+            if message_id is None:
+                # 尝试从 raw_message 获取
+                raw = event.message_obj.raw_message
+                if isinstance(raw, dict):
+                    message_id = raw.get('message_id')
+            
+            if message_id is None:
+                return False
+            
+            # 从配置获取表情设置
+            if stage == "start":
+                emoji_id = self.video_config.get("emoji_processing_id", 289)
+                emoji_type = self.video_config.get("emoji_processing_type", "1")
+                set_true = True
+            else:  # "done" - 完成或失败，添加完成表情
+                emoji_id = self.video_config.get("emoji_done_id", 124)
+                emoji_type = self.video_config.get("emoji_done_type", "1")
+                set_true = True
+            
+            # 调用 OneBot v11 API
+            await bot.set_msg_emoji_like(
+                message_id=int(message_id),
+                emoji_id=str(emoji_id),
+                emoji_type=emoji_type,
+                set=set_true,
+            )
+            return True
+        except Exception as e:
+            logger.debug(f"添加表情失败: {e}")
+            return False
 
     async def _check_ffmpeg(self) -> bool:
         try:
@@ -154,6 +201,9 @@ class VideoCompressPlugin(Star):
 
     async def _process_video(self, event: AstrMessageEvent, video: Video | File):
         try:
+            # 添加处理中表情
+            await self._mark_emoji(event, "start")
+            
             # 获取本地文件路径 - Video 和 File 有不同的方法
             if isinstance(video, Video):
                 file_path = await video.convert_to_file_path()
@@ -178,13 +228,20 @@ class VideoCompressPlugin(Star):
                 gpu_info = " (GPU加速)" if self._should_use_gpu() else ""
                 logger.info(f"视频压缩完成{ gpu_info }: {file_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB")
 
+                # 移除处理中表情，添加完成表情
+                await self._mark_emoji(event, "done")
+
                 compressed_video = Video.fromFileSystem(output_path)
                 yield event.chain_result([compressed_video, Plain(f"视频已压缩: {file_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB{gpu_info}")])
             else:
+                # 失败时移除处理中表情
+                await self._mark_emoji(event, "done")
                 yield event.plain_result("视频压缩失败")
 
         except Exception as e:
             logger.error(f"视频处理出错: {e}")
+            # 出错时移除处理中表情
+            await self._mark_emoji(event, "done")
             yield event.plain_result(f"视频处理出错: {e}")
 
     async def _compress_video(self, input_path: str, quality: str) -> Optional[str]:
@@ -417,6 +474,9 @@ class VideoCompressPlugin(Star):
         quality = quality or self.video_config.get("quality", "有损压缩 720p 60")
 
         try:
+            # 添加处理中表情
+            await self._mark_emoji(event, "start")
+            
             # 获取本地文件路径 - Video 和 File 有不同的方法
             if isinstance(video_msg, Video):
                 file_path = await video_msg.convert_to_file_path()
@@ -434,16 +494,22 @@ class VideoCompressPlugin(Star):
 
             if output_path and os.path.exists(output_path):
                 compressed_size = os.path.getsize(output_path) / (1024 * 1024)
+                # 添加完成表情
+                await self._mark_emoji(event, "done")
                 compressed_video = Video.fromFileSystem(output_path)
                 yield event.chain_result([
                     compressed_video,
                     Plain(f"压缩完成: {original_size:.1f}MB -> {compressed_size:.1f}MB ({quality}){gpu_status}")
                 ])
             else:
+                # 失败时添加完成表情
+                await self._mark_emoji(event, "done")
                 yield event.plain_result("视频压缩失败")
 
         except Exception as e:
             logger.error(f"指令压缩出错: {e}")
+            # 出错时添加完成表情
+            await self._mark_emoji(event, "done")
             yield event.plain_result(f"压缩出错: {e}")
 
     @filter.command("视频压缩设置")
