@@ -3,6 +3,7 @@
 AstrBot 视频压缩插件 - 自动检测群内视频消息，超过设定大小时自动压缩并发回原群聊。
 
 ## 功能特性
+<img src="./logo.png" align=right width=200></img>
 
 - **自动压缩**: 群内发送视频超过阈值时自动压缩并发回原群
 - **手动压缩**: 通过指令 `/压缩视频` 手动压缩指定视频
@@ -18,12 +19,8 @@ AstrBot 视频压缩插件 - 自动检测群内视频消息，超过设定大小
   - CentOS/RHEL: `yum install ffmpeg`
   - Windows: 从 [ffmpeg.org](https://ffmpeg.org/download.html) 下载并添加到 PATH
   - Docker: `apk add ffmpeg` (Alpine) 或 `apt install ffmpeg` (Debian/Ubuntu)
-
-## 安装方法
-
-1. 将插件目录 `astrbot_plugin_video_compress` 放入 AstrBot 的 `data/plugins/` 目录
-2. 重启 AstrBot 或在控制台执行插件重载
-3. 在 WebUI 插件管理中启用插件
+- **独立显卡(可选)**: 用于加速视频的转码速度
+  - Docker 请自行修改引用宿主机显卡
 
 ## 配置说明
 
@@ -79,6 +76,12 @@ AstrBot 视频压缩插件 - 自动检测群内视频消息，超过设定大小
 /视频压缩设置 group_remove 123456789
 ```
 
+## 安装方法
+
+1. 将插件目录 `astrbot_plugin_video_compress` 放入 AstrBot 的 `data/plugins/` 目录
+2. 重启 AstrBot 或在控制台执行插件重载
+3. 在 WebUI 插件管理中启用插件
+
 ## 配置文件示例
 
 ```json
@@ -108,24 +111,3 @@ AstrBot 视频压缩插件 - 自动检测群内视频消息，超过设定大小
 3. **大文件处理**: 超大视频压缩可能需要较长时间，默认超时 5 分钟
 4. **平台限制**: 不同平台发送视频的大小限制不同，压缩后仍可能超出平台限制
 5. **配置持久化**: 通过指令修改的配置仅在内存中，重启后恢复为配置文件值。持久化修改请编辑配置文件
-
-## 更新日志
-
-### v1.3.0
-- 新增 480p 30fps 和 360p 30fps 质量选项
-- 新增压缩后清理原始临时文件选项
-- 优化命令行参数验证
-- 修复配置显示问题
-
-### v1.2.0
-- 支持白名单/黑名单群组控制
-- 支持动态配置修改
-- 添加手动压缩指令
-
-### v1.1.0
-- 基础自动压缩功能
-- 支持多种质量预设
-
-## 许可证
-
-MIT License
