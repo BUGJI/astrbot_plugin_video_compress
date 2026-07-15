@@ -1,0 +1,20 @@
+{
+  "video_quality": {
+    "description": "视频大小",
+    "type": "string",
+    "options": ["无损压缩", "有损压缩 720p 60", "有损压缩 720p 30", "有损压缩 480p 60"],
+    "default": "有损压缩 720p 30"
+  },
+  "auto_compress": {
+    "description": "自动触发压缩视频",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，当视频文件大小超过阈值时会自动压缩"
+  },
+  "auto_compress_threshold": {
+    "description": "自动压缩超过多大的视频MB",
+    "type": "int",
+    "default": 300,
+    "hint": "单位：MB，仅当自动触发压缩视频开启时生效"
+  }
+}
