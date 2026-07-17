@@ -2,7 +2,7 @@ import os
 import asyncio
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
@@ -38,9 +38,10 @@ class VideoCompressPlugin(Star):
     async def terminate(self):
         pass
 
-    async def _mark_emoji(self, event: AstrMessageEvent, stage: str) -> bool:
+    async def _mark_emoji(self, event: AstrMessageEvent, stage: str, target_message_id: Optional[int] = None) -> bool:
         """给消息添加/移除表情回应
         stage: "start" 开始处理, "done" 完成处理(成功或失败)
+        target_message_id: 可选，指定要操作的消息ID
         """
         try:
             # 仅支持 aiocqhttp 适配器
@@ -48,13 +49,19 @@ class VideoCompressPlugin(Star):
                 return False
             
             bot = event.bot
-            message_id = event.message_obj.message_id if hasattr(event.message_obj, 'message_id') else None
             
-            if message_id is None:
-                # 尝试从 raw_message 获取
-                raw = event.message_obj.raw_message
-                if isinstance(raw, dict):
-                    message_id = raw.get('message_id')
+            # 如果指定了目标消息ID，使用它
+            if target_message_id is not None:
+                message_id = target_message_id
+            else:
+                # 否则尝试从消息中提取
+                message_id = event.message_obj.message_id if hasattr(event.message_obj, 'message_id') else None
+                
+                if message_id is None:
+                    # 尝试从 raw_message 获取
+                    raw = event.message_obj.raw_message
+                    if isinstance(raw, dict):
+                        message_id = raw.get('message_id')
             
             if message_id is None:
                 return False
@@ -64,7 +71,7 @@ class VideoCompressPlugin(Star):
                 emoji_id = self.video_config.get("emoji_processing_id", 289)
                 emoji_type = self.video_config.get("emoji_processing_type", "1")
                 set_true = True
-            else:  # "done" - 完成或失败，添加完成表情
+            else:  # "done"
                 emoji_id = self.video_config.get("emoji_done_id", 124)
                 emoji_type = self.video_config.get("emoji_done_type", "1")
                 set_true = True
@@ -174,6 +181,50 @@ class VideoCompressPlugin(Star):
                                 return comp
         return None
 
+    def _extract_reply_message_id(self, messages: list) -> Optional[int]:
+        """从消息链中提取被引用消息的ID"""
+        for msg in messages:
+            if isinstance(msg, Reply):
+                # 尝试从Reply组件获取被引用消息ID
+                if hasattr(msg, 'id'):
+                    return msg.id
+                if hasattr(msg, 'message_id'):
+                    return msg.message_id
+        return None
+
+    def _extract_video_with_reply(self, messages: list) -> Tuple[Optional[Video | File], Optional[int]]:
+        """从消息链中提取视频，并返回被引用消息的ID（如果有）"""
+        video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.webm', '.m4v', '.3gp', '.ts', '.mts'}
+        reply_message_id = None
+        
+        for msg in messages:
+            if isinstance(msg, Reply):
+                # 记录被引用消息的ID
+                if hasattr(msg, 'id'):
+                    reply_message_id = msg.id
+                elif hasattr(msg, 'message_id'):
+                    reply_message_id = msg.message_id
+                # 检查引用消息链中的视频
+                if msg.chain:
+                    for comp in msg.chain:
+                        if isinstance(comp, Video):
+                            return comp, reply_message_id
+                        if isinstance(comp, File):
+                            if comp.name:
+                                ext = os.path.splitext(comp.name)[1].lower()
+                                if ext in video_extensions:
+                                    return comp, reply_message_id
+            
+            if isinstance(msg, Video):
+                return msg, None
+            if isinstance(msg, File):
+                if msg.name:
+                    ext = os.path.splitext(msg.name)[1].lower()
+                    if ext in video_extensions:
+                        return msg, None
+        
+        return None, None
+
     def _should_use_gpu(self) -> bool:
         """判断是否应该使用GPU编码"""
         config_value = self.video_config.get("use_gpu", "auto")
@@ -196,12 +247,13 @@ class VideoCompressPlugin(Star):
         messages = event.get_messages()
         video = self._extract_video(messages)
         if video:
-            async for result in self._process_video(event, video):
+            # 自动压缩时，如果有引用消息，提取被引用消息的ID
+            reply_id = self._extract_reply_message_id(messages)
+            async for result in self._process_video(event, video, reply_id):
                 yield result
 
-    async def _process_video(self, event: AstrMessageEvent, video: Video | File):
+    async def _process_video(self, event: AstrMessageEvent, video: Video | File, target_message_id: Optional[int] = None):
         try:
-            
             # 获取本地文件路径 - Video 和 File 有不同的方法
             if isinstance(video, Video):
                 file_path = await video.convert_to_file_path()
@@ -215,12 +267,13 @@ class VideoCompressPlugin(Star):
             file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
             threshold_mb = self.video_config.get("threshold", 300)
 
+            # 如果文件小于阈值，不处理，也不添加表情
             if file_size_mb < threshold_mb:
                 return
 
-            # 添加受理表情
-            await self._mark_emoji(event, "start")
-            
+            # 只有确定要压缩时，才添加处理中表情
+            await self._mark_emoji(event, "start", target_message_id)
+
             quality = self.video_config.get("quality", "有损压缩 720p 30")
             output_path = await self._compress_video(file_path, quality)
 
@@ -230,19 +283,19 @@ class VideoCompressPlugin(Star):
                 logger.info(f"视频压缩完成{ gpu_info }: {file_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB")
 
                 # 移除处理中表情，添加完成表情
-                await self._mark_emoji(event, "done")
+                await self._mark_emoji(event, "done", target_message_id)
 
                 compressed_video = Video.fromFileSystem(output_path)
                 yield event.chain_result([compressed_video, Plain(f"视频已压缩: {file_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB{gpu_info}")])
             else:
                 # 失败时移除处理中表情
-                await self._mark_emoji(event, "done")
+                await self._mark_emoji(event, "done", target_message_id)
                 yield event.plain_result("视频压缩失败")
 
         except Exception as e:
             logger.error(f"视频处理出错: {e}")
             # 出错时移除处理中表情
-            await self._mark_emoji(event, "done")
+            await self._mark_emoji(event, "done", target_message_id)
             yield event.plain_result(f"视频处理出错: {e}")
 
     async def _compress_video(self, input_path: str, quality: str) -> Optional[str]:
@@ -291,7 +344,7 @@ class VideoCompressPlugin(Star):
             else:
                 cmd = [
                     "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease",
+                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease:force_divisible_by=2",
                     "-r", "60",
                     "-c:v", "libx264", "-crf", "23", "-preset", "medium",
                     "-c:a", "aac", "-b:a", "128k",
@@ -315,7 +368,7 @@ class VideoCompressPlugin(Star):
             else:
                 cmd = [
                     "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease",
+                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease:force_divisible_by=2",
                     "-r", "30",
                     "-c:v", "libx264", "-crf", "23", "-preset", "medium",
                     "-c:a", "aac", "-b:a", "128k",
@@ -339,7 +392,7 @@ class VideoCompressPlugin(Star):
             else:
                 cmd = [
                     "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:480:force_original_aspect_ratio=decrease",
+                    "-vf", "scale=-2:480:force_original_aspect_ratio=decrease:force_divisible_by=2",
                     "-r", "60",
                     "-c:v", "libx264", "-crf", "25", "-preset", "medium",
                     "-c:a", "aac", "-b:a", "96k",
@@ -363,7 +416,7 @@ class VideoCompressPlugin(Star):
             else:
                 cmd = [
                     "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:480:force_original_aspect_ratio=decrease",
+                    "-vf", "scale=-2:480:force_original_aspect_ratio=decrease:force_divisible_by=2",
                     "-r", "30",
                     "-c:v", "libx264", "-crf", "26", "-preset", "medium",
                     "-c:a", "aac", "-b:a", "64k",
@@ -387,7 +440,7 @@ class VideoCompressPlugin(Star):
             else:
                 cmd = [
                     "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:360:force_original_aspect_ratio=decrease",
+                    "-vf", "scale=-2:360:force_original_aspect_ratio=decrease:force_divisible_by=2",
                     "-r", "30",
                     "-c:v", "libx264", "-crf", "28", "-preset", "medium",
                     "-c:a", "aac", "-b:a", "48k",
@@ -412,7 +465,7 @@ class VideoCompressPlugin(Star):
             else:
                 cmd = [
                     "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease",
+                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease:force_divisible_by=2",
                     "-r", "30",
                     "-c:v", "libx264", "-crf", "23", "-preset", "medium",
                     "-c:a", "aac", "-b:a", "128k",
@@ -461,7 +514,7 @@ class VideoCompressPlugin(Star):
         质量选项: 无损压缩 / 有损压缩 720p 60 / 有损压缩 720p 30 / 有损压缩 480p 60 / 有损压缩 480p 30 / 有损压缩 360p 30
         回复视频或发送视频后使用此指令"""
         messages = event.get_messages()
-        video_msg = self._extract_video(messages)
+        video_msg, reply_id = self._extract_video_with_reply(messages)
 
         if not video_msg:
             yield event.plain_result("请发送或回复一个视频后再使用此指令")
@@ -475,8 +528,8 @@ class VideoCompressPlugin(Star):
         quality = quality or self.video_config.get("quality", "有损压缩 720p 60")
 
         try:
-            # 添加处理中表情
-            await self._mark_emoji(event, "start")
+            # 使用正确的消息ID添加表情
+            await self._mark_emoji(event, "start", target_message_id=reply_id)
             
             # 获取本地文件路径 - Video 和 File 有不同的方法
             if isinstance(video_msg, Video):
@@ -496,7 +549,7 @@ class VideoCompressPlugin(Star):
             if output_path and os.path.exists(output_path):
                 compressed_size = os.path.getsize(output_path) / (1024 * 1024)
                 # 添加完成表情
-                await self._mark_emoji(event, "done")
+                await self._mark_emoji(event, "done", target_message_id=reply_id)
                 compressed_video = Video.fromFileSystem(output_path)
                 yield event.chain_result([
                     compressed_video,
@@ -504,13 +557,13 @@ class VideoCompressPlugin(Star):
                 ])
             else:
                 # 失败时添加完成表情
-                await self._mark_emoji(event, "done")
+                await self._mark_emoji(event, "done", target_message_id=reply_id)
                 yield event.plain_result("视频压缩失败")
 
         except Exception as e:
             logger.error(f"指令压缩出错: {e}")
             # 出错时添加完成表情
-            await self._mark_emoji(event, "done")
+            await self._mark_emoji(event, "done", target_message_id=reply_id)
             yield event.plain_result(f"压缩出错: {e}")
 
     @filter.command("视频压缩设置")
