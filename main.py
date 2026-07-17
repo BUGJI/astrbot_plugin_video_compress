@@ -201,8 +201,6 @@ class VideoCompressPlugin(Star):
 
     async def _process_video(self, event: AstrMessageEvent, video: Video | File):
         try:
-            # 添加处理中表情
-            await self._mark_emoji(event, "start")
             
             # 获取本地文件路径 - Video 和 File 有不同的方法
             if isinstance(video, Video):
@@ -220,6 +218,9 @@ class VideoCompressPlugin(Star):
             if file_size_mb < threshold_mb:
                 return
 
+            # 添加受理表情
+            await self._mark_emoji(event, "start")
+            
             quality = self.video_config.get("quality", "有损压缩 720p 30")
             output_path = await self._compress_video(file_path, quality)
 
