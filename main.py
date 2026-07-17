@@ -244,6 +244,11 @@ class VideoCompressPlugin(Star):
         if not group_id or not self._check_group_allowed(group_id):
             return
 
+        # 跳过指令消息（以 / 开头），避免与指令处理器重复处理
+        message_str = event.message_str.strip()
+        if message_str.startswith("/"):
+            return
+
         messages = event.get_messages()
         video = self._extract_video(messages)
         if video:
