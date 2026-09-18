@@ -26,6 +26,30 @@
         "type": "bool",
         "default": true,
         "hint": "压缩完成后自动清理下载的原视频临时文件，节省磁盘空间"
+      },
+      "emoji_processing_id": {
+        "description": "处理中表情 ID",
+        "type": "int",
+        "default": 289,
+        "hint": "QQ 表情 ID，如 289=点赞，290=爱心，124=勾选"
+      },
+      "emoji_processing_type": {
+        "description": "处理中表情类型",
+        "type": "string",
+        "default": "1",
+        "hint": "表情类型，通常为 1"
+      },
+      "emoji_done_id": {
+        "description": "完成表情 ID",
+        "type": "int",
+        "default": 124,
+        "hint": "QQ 表情 ID，如 124=勾选，289=点赞"
+      },
+      "emoji_done_type": {
+        "description": "完成表情类型",
+        "type": "string",
+        "default": "1",
+        "hint": "表情类型，通常为 1"
       }
     }
   },

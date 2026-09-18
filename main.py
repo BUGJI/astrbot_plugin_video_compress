@@ -89,7 +89,7 @@ def normalize_quality(text) -> str:
     return ""
 
 
-@register("astrbot_plugin_video_compress", "BUGJI", "视频自动压缩器 - 群内视频自动压缩并发回原群 (支持NVIDIA GPU加速)", "1.3.1", "https://github.com/BUGJI/astrbot_plugin_video_compress")
+@register("astrbot_plugin_video_compress", "BUGJI", "视频自动压缩器 - 群内视频自动压缩并发回原群 (支持NVIDIA GPU加速)", "1.4.0", "https://github.com/BUGJI/astrbot_plugin_video_compress")
 class VideoCompressPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context, config)
@@ -311,6 +311,7 @@ class VideoCompressPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
+        """监听是否有合适的视频消息"""
         if not self.video_config.get("auto_compress", False):
             return
 
@@ -387,170 +388,206 @@ class VideoCompressPlugin(Star):
         use_gpu = self._should_use_gpu()
         use_nvenc = use_gpu and self._gpu_available
         
-        # 构建基础压缩命令
-        if quality == "无损压缩":
-            if use_nvenc:
-                # NVENC不支持无损压缩，降级到CPU
-                logger.info("NVENC不支持无损压缩，使用CPU编码")
+        # 尝试编码（支持GPU失败回退CPU）
+        for attempt in range(2):  # 最多尝试2次：GPU -> CPU
+            current_use_nvenc = use_nvenc and (attempt == 0)
+            
+            # 构建基础压缩命令
+            if quality == "无损压缩":
+                if current_use_nvenc:
+                    # NVENC不支持无损压缩，降级到CPU
+                    logger.info("NVENC不支持无损压缩，使用CPU编码")
+                    current_use_nvenc = False
                 cmd = [
                     "ffmpeg", "-y", "-i", input_path,
                     "-c:v", "libx264", "-crf", "0", "-preset", "veryslow",
                     "-c:a", "copy",
                     output_path
                 ]
+            elif quality == "有损压缩 720p 60":
+                cmd = self._build_cmd_720p60(input_path, output_path, current_use_nvenc)
+            elif quality == "有损压缩 720p 30":
+                cmd = self._build_cmd_720p30(input_path, output_path, current_use_nvenc)
+            elif quality == "有损压缩 480p 60":
+                cmd = self._build_cmd_480p60(input_path, output_path, current_use_nvenc)
+            elif quality == "有损压缩 480p 30":
+                cmd = self._build_cmd_480p30(input_path, output_path, current_use_nvenc)
+            elif quality == "有损压缩 360p 30":
+                cmd = self._build_cmd_360p30(input_path, output_path, current_use_nvenc)
             else:
-                cmd = [
-                    "ffmpeg", "-y", "-i", input_path,
-                    "-c:v", "libx264", "-crf", "0", "-preset", "veryslow",
-                    "-c:a", "copy",
-                    output_path
-                ]
-        elif quality == "有损压缩 720p 60":
-            if use_nvenc:
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-hwaccel", "cuda",
-                    "-hwaccel_output_format", "cuda",
-                    "-i", input_path,
-                    "-vf", "scale_cuda=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "60",
-                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart",
-                    "-metadata:s:v", "rotate=0",
-                    output_path
-                ]
+                # 默认
+                cmd = self._build_cmd_default(input_path, output_path, current_use_nvenc)
+            
+            # 执行压缩
+            success = await self._execute_ffmpeg(cmd, output_path, input_path)
+            if success:
+                return output_path
+            
+            # 失败时清理输出文件
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            
+            # 如果是GPU模式失败，尝试CPU模式
+            if current_use_nvenc:
+                logger.warning(f"NVENC 编码失败，自动回退到 CPU 编码 (quality={quality})")
+                use_nvenc = False  # 下次循环使用CPU
             else:
-                cmd = [
-                    "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "60",
-                    "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                    "-c:a", "aac", "-b:a", "128k",
-                    output_path
-                ]
-        elif quality == "有损压缩 720p 30":
-            if use_nvenc:
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-hwaccel", "cuda",
-                    "-hwaccel_output_format", "cuda",
-                    "-i", input_path,
-                    "-vf", "scale_cuda=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "30",
-                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart",
-                    "-metadata:s:v", "rotate=0",
-                    output_path
-                ]
-            else:
-                cmd = [
-                    "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "30",
-                    "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                    "-c:a", "aac", "-b:a", "128k",
-                    output_path
-                ]
-        elif quality == "有损压缩 480p 60":
-            if use_nvenc:
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-hwaccel", "cuda",
-                    "-hwaccel_output_format", "cuda",
-                    "-i", input_path,
-                    "-vf", "scale_cuda=w=854:h=480:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "60",
-                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "25",
-                    "-c:a", "aac", "-b:a", "96k",
-                    "-movflags", "+faststart",
-                    "-metadata:s:v", "rotate=0",
-                    output_path
-                ]
-            else:
-                cmd = [
-                    "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:480:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "60",
-                    "-c:v", "libx264", "-crf", "25", "-preset", "medium",
-                    "-c:a", "aac", "-b:a", "96k",
-                    output_path
-                ]
-        elif quality == "有损压缩 480p 30":
-            if use_nvenc:
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-hwaccel", "cuda",
-                    "-hwaccel_output_format", "cuda",
-                    "-i", input_path,
-                    "-vf", "scale_cuda=w=854:h=480:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "30",
-                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "26",
-                    "-c:a", "aac", "-b:a", "64k",
-                    "-movflags", "+faststart",
-                    "-metadata:s:v", "rotate=0",
-                    output_path
-                ]
-            else:
-                cmd = [
-                    "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:480:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "30",
-                    "-c:v", "libx264", "-crf", "26", "-preset", "medium",
-                    "-c:a", "aac", "-b:a", "64k",
-                    output_path
-                ]
-        elif quality == "有损压缩 360p 30":
-            if use_nvenc:
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-hwaccel", "cuda",
-                    "-hwaccel_output_format", "cuda",
-                    "-i", input_path,
-                    "-vf", "scale_cuda=w=640:h=360:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "30",
-                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "28",
-                    "-c:a", "aac", "-b:a", "48k",
-                    "-movflags", "+faststart",
-                    "-metadata:s:v", "rotate=0",
-                    output_path
-                ]
-            else:
-                cmd = [
-                    "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:360:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "30",
-                    "-c:v", "libx264", "-crf", "28", "-preset", "medium",
-                    "-c:a", "aac", "-b:a", "48k",
-                    output_path
-                ]
-        else:
-            # 默认
-            if use_nvenc:
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-hwaccel", "cuda",
-                    "-hwaccel_output_format", "cuda",
-                    "-i", input_path,
-                    "-vf", "scale_cuda=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "30",
-                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart",
-                    "-metadata:s:v", "rotate=0",
-                    output_path
-                ]
-            else:
-                cmd = [
-                    "ffmpeg", "-y", "-i", input_path,
-                    "-vf", "scale=-2:720:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-r", "30",
-                    "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                    "-c:a", "aac", "-b:a", "128k",
-                    output_path
-                ]
+                # CPU也失败了，彻底放弃
+                break
+        
+        return None
 
+    def _build_cmd_720p60(self, input_path: str, output_path: str, use_nvenc: bool) -> list:
+        if use_nvenc:
+            return [
+                "ffmpeg", "-y",
+                "-hwaccel", "cuda",
+                "-hwaccel_output_format", "cuda",
+                "-i", input_path,
+                "-vf", "scale_cuda=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "60",
+                "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                "-metadata:s:v", "rotate=0",
+                output_path
+            ]
+        else:
+            return [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", "scale=-2:720:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "60",
+                "-c:v", "libx264", "-crf", "23", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "128k",
+                output_path
+            ]
+
+    def _build_cmd_720p30(self, input_path: str, output_path: str, use_nvenc: bool) -> list:
+        if use_nvenc:
+            return [
+                "ffmpeg", "-y",
+                "-hwaccel", "cuda",
+                "-hwaccel_output_format", "cuda",
+                "-i", input_path,
+                "-vf", "scale_cuda=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "30",
+                "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                "-metadata:s:v", "rotate=0",
+                output_path
+            ]
+        else:
+            return [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", "scale=-2:720:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "30",
+                "-c:v", "libx264", "-crf", "23", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "128k",
+                output_path
+            ]
+
+    def _build_cmd_480p60(self, input_path: str, output_path: str, use_nvenc: bool) -> list:
+        if use_nvenc:
+            return [
+                "ffmpeg", "-y",
+                "-hwaccel", "cuda",
+                "-hwaccel_output_format", "cuda",
+                "-i", input_path,
+                "-vf", "scale_cuda=w=854:h=480:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "60",
+                "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "25",
+                "-c:a", "aac", "-b:a", "96k",
+                "-movflags", "+faststart",
+                "-metadata:s:v", "rotate=0",
+                output_path
+            ]
+        else:
+            return [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", "scale=-2:480:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "60",
+                "-c:v", "libx264", "-crf", "25", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "96k",
+                output_path
+            ]
+
+    def _build_cmd_480p30(self, input_path: str, output_path: str, use_nvenc: bool) -> list:
+        if use_nvenc:
+            return [
+                "ffmpeg", "-y",
+                "-hwaccel", "cuda",
+                "-hwaccel_output_format", "cuda",
+                "-i", input_path,
+                "-vf", "scale_cuda=w=854:h=480:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "30",
+                "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "26",
+                "-c:a", "aac", "-b:a", "64k",
+                "-movflags", "+faststart",
+                "-metadata:s:v", "rotate=0",
+                output_path
+            ]
+        else:
+            return [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", "scale=-2:480:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "30",
+                "-c:v", "libx264", "-crf", "26", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "64k",
+                output_path
+            ]
+
+    def _build_cmd_360p30(self, input_path: str, output_path: str, use_nvenc: bool) -> list:
+        if use_nvenc:
+            return [
+                "ffmpeg", "-y",
+                "-hwaccel", "cuda",
+                "-hwaccel_output_format", "cuda",
+                "-i", input_path,
+                "-vf", "scale_cuda=w=640:h=360:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "30",
+                "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "28",
+                "-c:a", "aac", "-b:a", "48k",
+                "-movflags", "+faststart",
+                "-metadata:s:v", "rotate=0",
+                output_path
+            ]
+        else:
+            return [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", "scale=-2:360:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "30",
+                "-c:v", "libx264", "-crf", "28", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "48k",
+                output_path
+            ]
+
+    def _build_cmd_default(self, input_path: str, output_path: str, use_nvenc: bool) -> list:
+        if use_nvenc:
+            return [
+                "ffmpeg", "-y",
+                "-hwaccel", "cuda",
+                "-hwaccel_output_format", "cuda",
+                "-i", input_path,
+                "-vf", "scale_cuda=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "30",
+                "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                "-metadata:s:v", "rotate=0",
+                output_path
+            ]
+        else:
+            return [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", "scale=-2:720:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-r", "30",
+                "-c:v", "libx264", "-crf", "23", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "128k",
+                output_path
+            ]
+
+    async def _execute_ffmpeg(self, cmd: list, output_path: str, input_path: str) -> bool:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -567,25 +604,25 @@ class VideoCompressPlugin(Star):
                             os.remove(input_path)
                     except Exception as e:
                         logger.debug(f"清理原始临时文件失败: {e}")
-                return output_path
+                return True
             else:
                 if proc.returncode != 0:
                     error_msg = stderr.decode()
-                    logger.error(f"FFmpeg 压缩失败: {error_msg}")
+                    logger.error(f"FFmpeg 压缩失败 (returncode={proc.returncode}): {error_msg}")
                 if os.path.exists(output_path):
                     os.remove(output_path)
-                return None
+                return False
 
         except asyncio.TimeoutError:
             logger.error("视频压缩超时 (5分钟)")
             if os.path.exists(output_path):
                 os.remove(output_path)
-            return None
+            return False
         except Exception as e:
             logger.error(f"压缩异常: {e}")
             if os.path.exists(output_path):
                 os.remove(output_path)
-            return None
+            return False
 
     @filter.command("压缩视频")
     async def cmd_compress_video(self, event: AstrMessageEvent, quality: str = ""):

@@ -1,5 +1,12 @@
 ## 更新日志
 
+### v1.4.0
+- 新增 NVENC 编码失败自动回退：GPU 编码失败时自动改用 CPU 重试一次（此前直接返回"视频压缩失败"）
+- 编码命令构建重构为 `_build_cmd_720p60/720p30/480p60/480p30/360p30/default` 系列方法，`_compress_video()` 只负责调度与回退
+- `_execute_ffmpeg()` 拆分为独立方法，返回 bool 并输出更完整的错误信息（含 returncode）
+- 补齐 WebUI 配置项 `emoji_processing_id` / `emoji_processing_type` / `emoji_done_id` / `emoji_done_type`（代码一直在读这几项，之前 schema 里缺失）
+- 无损压缩在 NVENC 模式下自动改用 CPU 编码（NVENC 不支持 crf=0 无损）
+
 ### v1.3.1
 - 修复指令参数带空格时匹配失败的问题
   - `/压缩视频 有损压缩 720p 30`、`/视频压缩设置 quality 有损压缩 480p 30` 此前只会取到第一个词（"有损压缩"），导致永远提示"无效的质量选项"
