@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import uuid
 from pathlib import Path
@@ -15,7 +16,80 @@ if TYPE_CHECKING:
     from aiocqhttp import CQHttp
 
 
-@register("astrbot_plugin_video_compress", "BUGJI", "视频自动压缩器 - 群内视频自动压缩并发回原群 (支持NVIDIA GPU加速)", "2.0.0", "https://github.com/BUGJI/astrbot_plugin_video_compress")
+# 质量预设（指令校验与配置校验共用同一份数据）
+QUALITY_PRESETS = [
+    "无损压缩",
+    "有损压缩 720p 60",
+    "有损压缩 720p 30",
+    "有损压缩 480p 60",
+    "有损压缩 480p 30",
+    "有损压缩 360p 30",
+]
+
+# 简写别名 -> 预设
+QUALITY_ALIASES = {
+    "无损": "无损压缩",
+}
+
+# 常见唤醒前缀
+_WAKE_PREFIXES = ("/", "／", "!", "！")
+
+
+def _normalize_spaces(text) -> str:
+    """统一空白字符（含全角空格）并去掉首尾空白。"""
+    return re.sub(r"[\s\u3000]+", " ", str(text or "")).strip()
+
+
+def extract_raw_args(event, command_names) -> str:
+    """取指令名之后的完整原始文本（保留内部空格）。
+
+    AstrBot 的指令过滤器会把指令后的文本按空格切分成列表，再按位置依次赋给
+    handler 的形参（见 astrbot/core/star/filter/command.py:209）。因此
+    `/压缩视频 有损压缩 720p 30` 只会传进来 quality="有损压缩"，
+    "720p 30" 被直接丢弃，导致带空格的质量参数永远匹配不上预设。
+    这里改为从原始消息文本中取回指令之后的全部内容。
+    """
+    getter = getattr(event, "get_message_str", None)
+    raw = getter() if callable(getter) else getattr(event, "message_str", "")
+    text = _normalize_spaces(raw)
+    if not text:
+        return ""
+
+    # 指令名可能带唤醒前缀（/、! 等），长指令名优先
+    for name in sorted(command_names, key=len, reverse=True):
+        for candidate in (name, *(p + name for p in _WAKE_PREFIXES)):
+            if text.startswith(candidate):
+                return text[len(candidate):].strip()
+
+    # 兜底：前缀里还有唤醒词/机器人昵称时，取最后一次出现的指令名之后的内容
+    idx, offset = -1, 0
+    for name in command_names:
+        pos = text.rfind(name)
+        if pos > idx:
+            idx, offset = pos, len(name)
+    return text[idx + offset:].strip() if idx >= 0 else ""
+
+
+def normalize_quality(text) -> str:
+    """把用户输入的 quality 归一化到预设值，容忍多余或缺失的空格。
+
+    无法识别时返回空串。
+    """
+    normalized = _normalize_spaces(text)
+    if not normalized:
+        return ""
+    if normalized in QUALITY_PRESETS:
+        return normalized
+    if normalized in QUALITY_ALIASES:
+        return QUALITY_ALIASES[normalized]
+    compact = normalized.replace(" ", "")
+    for preset in QUALITY_PRESETS:
+        if preset.replace(" ", "") == compact:
+            return preset
+    return ""
+
+
+@register("astrbot_plugin_video_compress", "BUGJI", "视频自动压缩器 - 群内视频自动压缩并发回原群 (支持NVIDIA GPU加速)", "1.3.1", "https://github.com/BUGJI/astrbot_plugin_video_compress")
 class VideoCompressPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context, config)
@@ -525,10 +599,15 @@ class VideoCompressPlugin(Star):
             yield event.plain_result("请发送或回复一个视频后再使用此指令")
             return
 
-        valid_qualities = ["无损压缩", "有损压缩 720p 60", "有损压缩 720p 30", "有损压缩 480p 60", "有损压缩 480p 30", "有损压缩 360p 30"]
-        if quality and quality not in valid_qualities:
-            yield event.plain_result(f"无效的质量选项，可选: {', '.join(valid_qualities)}")
-            return
+        # 框架按空格切分参数，这里从原始文本取完整质量参数（如 "有损压缩 720p 30"）
+        raw_quality = extract_raw_args(event, ("压缩视频",)) or _normalize_spaces(quality)
+        if raw_quality:
+            quality = normalize_quality(raw_quality)
+            if not quality:
+                yield event.plain_result(f"无效的质量选项，可选: {', '.join(QUALITY_PRESETS)}")
+                return
+        else:
+            quality = ""
 
         quality = quality or self.video_config.get("quality", "有损压缩 720p 60")
 
@@ -583,6 +662,15 @@ class VideoCompressPlugin(Star):
         - group_add <群号>
         - group_remove <群号>
         """
+        # 框架按空格切分参数，key/value 从原始文本重新切分（value 允许带空格）
+        raw_args = extract_raw_args(event, ("视频压缩设置",))
+        if raw_args:
+            parts = raw_args.split(" ", 1)
+            key = parts[0]
+            value = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            key, value = _normalize_spaces(key), _normalize_spaces(value)
+
         if not key:
             video_cfg = self.video_config
             group_cfg = self.group_config
@@ -609,12 +697,12 @@ class VideoCompressPlugin(Star):
             except ValueError:
                 yield event.plain_result("阈值必须是数字")
         elif key == "quality":
-            valid = ["无损压缩", "有损压缩 720p 60", "有损压缩 720p 30", "有损压缩 480p 60", "有损压缩 480p 30", "有损压缩 360p 30"]
-            if value in valid:
-                self.video_config["quality"] = value
-                yield event.plain_result(f"质量已设置为: {value}")
+            normalized = normalize_quality(value)
+            if normalized:
+                self.video_config["quality"] = normalized
+                yield event.plain_result(f"质量已设置为: {normalized}")
             else:
-                yield event.plain_result(f"无效质量，可选: {', '.join(valid)}")
+                yield event.plain_result(f"无效质量，可选: {', '.join(QUALITY_PRESETS)}")
         elif key == "use_gpu":
             if value in ["auto", "enabled", "disabled"]:
                 self.video_config["use_gpu"] = value
