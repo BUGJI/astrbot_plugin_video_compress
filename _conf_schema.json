@@ -4,22 +4,36 @@
     "type": "object",
     "items": {
       "quality": {
-        "description": "压缩质量预设",
+        "description": "全局默认压缩质量预设",
         "type": "string",
         "options": ["无损压缩", "有损压缩 720p 60", "有损压缩 720p 30", "有损压缩 480p 60", "有损压缩 480p 30", "有损压缩 360p 30"],
-        "default": "有损压缩 720p 30"
+        "default": "有损压缩 720p 30",
+        "hint": "用户没有个人默认时使用该预设；用户可通过 /压缩视频 默认 <预设> 覆盖"
+      },
+      "use_gpu": {
+        "description": "GPU 编码设置",
+        "type": "string",
+        "options": ["auto", "enabled", "disabled"],
+        "default": "auto",
+        "hint": "auto：检测到 NVENC 时自动使用；enabled：优先 GPU，失败回退 CPU；disabled：始终使用 CPU"
       },
       "auto_compress": {
-        "description": "自动触发压缩视频",
+        "description": "自动触发压缩群聊视频",
         "type": "bool",
         "default": false,
-        "hint": "开启后，当视频文件大小超过阈值时会自动压缩并发回原群"
+        "hint": "开启后，当群聊视频文件大小超过阈值时会自动压缩并发回原群"
+      },
+      "auto_compress_private": {
+        "description": "自动触发压缩单聊视频",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，单聊中超过阈值的视频也会自动压缩；QQ 官方单聊被动回复次数较少，请谨慎开启"
       },
       "threshold": {
         "description": "自动压缩阈值 (MB)",
         "type": "int",
         "default": 300,
-        "hint": "单位：MB，仅当自动触发压缩视频开启时生效。视频超过此大小将被自动压缩"
+        "hint": "单位：MB，仅当自动压缩开启时生效。视频超过此大小将被自动压缩"
       },
       "delete_original_after_compress": {
         "description": "压缩后删除临时原视频文件",
@@ -27,29 +41,111 @@
         "default": true,
         "hint": "压缩完成后自动清理下载的原视频临时文件，节省磁盘空间"
       },
+      "skip_if_not_smaller": {
+        "description": "压缩后没有变小时不发送",
+        "type": "bool",
+        "default": true,
+        "hint": "如果压缩后的文件比原文件还大，自动模式直接放弃，手动模式提示已保留原视频"
+      },
+      "timeout_seconds": {
+        "description": "单个视频压缩超时 (秒)",
+        "type": "int",
+        "default": 600,
+        "hint": "大视频或 CPU 软编码可能需要更久，建议 300~1800"
+      },
+      "max_concurrent": {
+        "description": "同时压缩的视频数量",
+        "type": "int",
+        "default": 1,
+        "hint": "默认 1，避免多个 ffmpeg 同时占满 CPU/GPU；范围 1~8"
+      },
+      "progress_message": {
+        "description": "压缩进度提示",
+        "type": "string",
+        "options": ["自动", "总是", "关闭"],
+        "default": "自动",
+        "hint": "自动：手动压缩提示、自动压缩不提示；总是：两种都提示；关闭：不提示。QQ 官方被动回复次数有限，建议自动"
+      },
       "emoji_processing_id": {
         "description": "处理中表情 ID",
         "type": "int",
         "default": 289,
-        "hint": "QQ 表情 ID，如 289=点赞，290=爱心，124=勾选"
+        "hint": "仅 OneBot 且协议端支持贴表情时生效；QQ 官方会忽略。289=点赞，290=爱心，124=勾选"
       },
       "emoji_processing_type": {
         "description": "处理中表情类型",
         "type": "string",
         "default": "1",
-        "hint": "表情类型，通常为 1"
+        "hint": "表情类型，通常为 1；仅 OneBot 生效"
       },
       "emoji_done_id": {
         "description": "完成表情 ID",
         "type": "int",
         "default": 124,
-        "hint": "QQ 表情 ID，如 124=勾选，289=点赞"
+        "hint": "仅 OneBot 且协议端支持贴表情时生效；QQ 官方会忽略。124=勾选，289=点赞"
       },
       "emoji_done_type": {
         "description": "完成表情类型",
         "type": "string",
         "default": "1",
-        "hint": "表情类型，通常为 1"
+        "hint": "表情类型，通常为 1；仅 OneBot 生效"
+      }
+    }
+  },
+  "platform": {
+    "description": "平台适配设置",
+    "type": "object",
+    "items": {
+      "mode": {
+        "description": "平台识别模式",
+        "type": "string",
+        "options": ["自动", "OneBot", "QQ 官方"],
+        "default": "自动",
+        "hint": "自动根据 AstrBot 适配器识别；识别异常时可强制指定。QQ 官方不支持贴表情，视频软限制约 30MB"
+      },
+      "emoji": {
+        "description": "贴表情开关",
+        "type": "string",
+        "options": ["自动", "开启", "关闭"],
+        "default": "自动",
+        "hint": "自动：OneBot 尝试贴表情、QQ 官方忽略；开启：强制尝试；关闭：完全不贴表情"
+      },
+      "qq_official_video_soft_limit_mb": {
+        "description": "QQ 官方视频软限制 (MB)",
+        "type": "int",
+        "default": 30,
+        "hint": "超过该大小 QQ 会把视频降级为文件；插件会按 oversize 配置处理"
+      },
+      "qq_official_video_hard_limit_mb": {
+        "description": "QQ 官方视频硬限制 (MB)",
+        "type": "int",
+        "default": 200,
+        "hint": "超过该大小视频和文件都无法发送，插件会直接报错"
+      }
+    }
+  },
+  "oversize": {
+    "description": "压缩后仍超过平台限制时的处理",
+    "type": "object",
+    "items": {
+      "action": {
+        "description": "超限处理方式",
+        "type": "string",
+        "options": ["重新压缩后仍超限则发送文件", "重新压缩", "发送文件"],
+        "default": "重新压缩后仍超限则发送文件",
+        "hint": "QQ 官方视频软限制约 30MB：推荐先按目标大小重压，仍超限再发文件"
+      },
+      "target_mb": {
+        "description": "重新压缩的目标大小 (MB)",
+        "type": "int",
+        "default": 25,
+        "hint": "重压时使用的目标文件大小，建议比平台软限制小 3~5MB"
+      },
+      "max_attempts": {
+        "description": "重新压缩尝试次数",
+        "type": "int",
+        "default": 1,
+        "hint": "范围 1~5；次数越多越耗时"
       }
     }
   },
@@ -60,15 +156,15 @@
       "mode": {
         "description": "启用模式",
         "type": "string",
-        "options": ["黑名单", "白名单"],
+        "options": ["白名单", "黑名单", "全部"],
         "default": "白名单",
-        "hint": "白名单：仅指定群号生效；黑名单：指定群号不生效"
+        "hint": "白名单：仅指定群号生效；黑名单：指定群号不生效；全部：所有群生效"
       },
       "group_ids": {
         "description": "群号列表",
         "type": "list",
         "default": [],
-        "hint": "填写需要生效或不生效的群号列表（根据启用模式决定）"
+        "hint": "填写需要生效或不生效的群号列表。QQ 官方的群号是 group_openid，可在 /压缩视频 状态 中查看当前会话 ID"
       }
     }
   }
